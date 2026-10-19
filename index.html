@@ -538,42 +538,73 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     run().catch(handleError);
   </script>
 <!-- ======================================================= -->
-<!-- MediaSession 播放器偽裝 + 手機鎖屏零延遲終極防凍結腳本        -->
+<!-- 15-25分鐘長計時防深度休眠 (Web Worker + Web Audio 震盪器) -->
 <!-- ======================================================= -->
 <script>
-  // 1. 使用極微弱頻率的保鮮音訊（防止系統判定為無聲音訊而凍結）
-  const silentAudio = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=");
-  silentAudio.loop = true;
+  // 1. 建立 Web Worker (獨立背景執行緒，不受主線程鎖屏凍結影響)
+  const workerCode = `
+    let timer = null;
+    self.onmessage = function(e) {
+      if (e.data.cmd === 'start') {
+        const targetTime = e.data.targetTime;
+        if (timer) clearInterval(timer);
+        timer = setInterval(() => {
+          if (Date.now() >= targetTime) {
+            clearInterval(timer);
+            self.postMessage('TIME_UP');
+          }
+        }, 500);
+      } else if (e.data.cmd === 'stop') {
+        if (timer) clearInterval(timer);
+      }
+    };
+  `;
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  const worker = new Worker(URL.createObjectURL(blob));
 
-  // 載入響鈴音效 (請確認 alarm_2.wav 與 index.html 放在同目錄)[cite: 2]
+  // 2. 初始化 Web Audio API 底層震盪器 (防止手機 5 分鐘後進入 Deep Sleep)
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  let audioCtx = null;
+  let oscNode = null;
+  let gainNode = null;
+
   const alarmSound = new Audio("alarm_2.wav");[cite: 2]
 
-  let wakeLock = null;
-  let pomodoroTimer = null;
-
-  // 2. 向手機作業系統註冊為「真實媒體播放器」(解決亮螢幕才響的關鍵！)
-  function registerMediaSession() {
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: '番茄鐘專注倒數中...',
-        artist: '資訊獨立研究專案',
-        album: '背景保鮮進行中'
-      });
-      
-      // 註冊空的播放控制，防止系統自動關閉媒體線程
-      navigator.mediaSession.setActionHandler('play', () => {});
-      navigator.mediaSession.setActionHandler('pause', () => {});
+  function initWebAudio() {
+    if (!audioCtx) {
+      audioCtx = new AudioContext();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
     }
   }
 
-  // 點擊頁面解鎖音訊權限
-  document.addEventListener('click', function initAudio() {
-    silentAudio.play().then(() => silentAudio.pause()).catch(() => {});
-    alarmSound.load();
-    registerMediaSession();
-  }, { once: true });
+  // 啟動人類聽不到（音量 0.0001）但硬體持續運作的音訊震盪器
+  function startAudioKeepAlive() {
+    initWebAudio();
+    if (oscNode) return; // 避免重複建立
 
-  // 3. 螢幕防休眠 Wake Lock
+    oscNode = audioCtx.createOscillator();
+    gainNode = audioCtx.createGain();
+
+    // 音量設為極微弱的 0.0001，避免無聲被系統關閉，同時完全不影響聽覺
+    gainNode.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+    oscNode.frequency.setValueAtTime(440, audioCtx.currentTime);
+
+    oscNode.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    oscNode.start();
+  }
+
+  function stopAudioKeepAlive() {
+    if (oscNode) {
+      try { oscNode.stop(); } catch(e) {}
+      oscNode = null;
+    }
+  }
+
+  // 3. 防休眠與媒體卡片設定
+  let wakeLock = null;
   async function requestWakeLock() {
     try {
       if ('wakeLock' in navigator) {
@@ -588,7 +619,26 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   }
 
-  // 4. 響鈴控制 (專注 10 次 / 休息 5 次)
+  function registerMediaSession() {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: '番茄鐘計時進行中',
+        artist: '資訊獨立研究專案',
+        album: '長時間背景保鮮中'
+      });
+      navigator.mediaSession.setActionHandler('play', () => {});
+      navigator.mediaSession.setActionHandler('pause', () => {});
+    }
+  }
+
+  // 使用者點擊頁面時解鎖音訊權限
+  document.addEventListener('click', function() {
+    initWebAudio();
+    alarmSound.load();
+    registerMediaSession();
+  }, { once: true });
+
+  // 4. 響鈴機制 (專注 10 次 / 休息 5 次)
   function ringAlarm(repeatTimes) {
     let currentCount = 0;
 
@@ -598,8 +648,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         alarmSound.currentTime = 0;
         alarmSound.play().catch(e => console.log(e));
       } else {
-        silentAudio.pause();
-        silentAudio.currentTime = 0;
+        stopAudioKeepAlive();
         releaseWakeLock();
       }
     };
@@ -608,27 +657,26 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     alarmSound.play().catch(e => console.log("響鈴失敗:", e));
   }
 
-  // 5. 核心背景倒數
+  let currentStageMode = 1;
+
+  // 接收 Web Worker 傳回的「時間到」訊號
+  worker.onmessage = function(e) {
+    if (e.data === 'TIME_UP') {
+      const repeatTimes = (currentStageMode === 1) ? 10 : 5;
+      ringAlarm(repeatTimes);
+    }
+  };
+
+  // 5. 核心啟動控制
   function startPomodoroBySeconds(seconds, stageMode) {
+    currentStageMode = stageMode;
+    initWebAudio();
     requestWakeLock();
     registerMediaSession();
-
-    // 啟動背景音訊並向系統宣告播放狀態
-    silentAudio.currentTime = 0;
-    silentAudio.play().catch(() => {});
+    startAudioKeepAlive(); // 啟動背景保鮮震盪器
 
     const targetTime = Date.now() + seconds * 1000;
-
-    if (pomodoroTimer) clearInterval(pomodoroTimer);
-
-    pomodoroTimer = setInterval(() => {
-      if (Date.now() >= targetTime) {
-        clearInterval(pomodoroTimer);
-
-        const repeatTimes = (stageMode === 1) ? 10 : 5;
-        ringAlarm(repeatTimes);
-      }
-    }, 200);
+    worker.postMessage({ cmd: 'start', targetTime: targetTime });
   }
 
   // 6. 自動監聽 Scratch 變數 (all, 階段, 啟動觸發)
@@ -636,16 +684,16 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     if (window.P2 && P2.p2 && P2.p2.vm) {
       const vm = P2.p2.vm;
       const stage = vm.runtime.getTargetForStage();
-      
+
       if (stage && stage.variables) {
         const vars = Object.values(stage.variables);
-        
+
         const triggerVar = vars.find(v => v.name === '啟動觸發');
         const allVar = vars.find(v => v.name === 'all');
         const stageVar = vars.find(v => v.name === '階段');
 
         if (triggerVar && Number(triggerVar.value) === 1) {
-          triggerVar.value = 0;
+          triggerVar.value = 0; // 歸零旗標
 
           const seconds = allVar ? Number(allVar.value) : 1500;
           const stageVal = stageVar ? Number(stageVar.value) : 1;
