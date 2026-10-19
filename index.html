@@ -538,57 +538,69 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     run().catch(handleError);
   </script>
 <!-- ======================================================= -->
-<!-- 全功能終極版：螢幕強制常亮 (Wake Lock) + 多執行緒 + 雙重音訊    -->
+<!-- 隱藏影片防休眠 (NoSleep Video Fallback) + 雙重計時腳本        -->
 <!-- ======================================================= -->
-<script>
-  // 1. 建立 Web Worker（獨立背景執行緒，確保倒數時間絕對精準）
-  const workerCode = `
-    let timer = null;
-    self.onmessage = function(e) {
-      if (e.data.cmd === 'start') {
-        const targetTime = e.data.targetTime;
-        if (timer) clearInterval(timer);
-        timer = setInterval(() => {
-          if (Date.now() >= targetTime) {
-            clearInterval(timer);
-            self.postMessage('TIME_UP');
-          }
-        }, 300);
-      } else if (e.data.cmd === 'stop') {
-        if (timer) clearInterval(timer);
-      }
-    };
-  `;
-  const blob = new Blob([workerCode], { type: 'application/javascript' });
-  const worker = new Worker(URL.createObjectURL(blob));
 
-  // 2. 音訊元件與 Web Audio API 初始化
+<!-- 建立隱藏的防休眠微型影片元件 (1x1 Base64 MP4 影片) -->
+<video id="no-sleep-video" playsinline loop muted style="position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;">
+  <source src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAAAAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAAdtZGF0AAAAAAA=" type="video/mp4">
+</video>
+
+<script>
+  // 1. 初始化元件與音訊
+  const videoElem = document.getElementById('no-sleep-video');
+  const alarmSound = new Audio("alarm_2.wav");[cite: 2]
+
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   let audioCtx = null;
   let oscNode = null;
   let gainNode = null;
-
-  // 音效檔案載入 (請確認 alarm_2.wav 與 HTML 放在同資料夾下)[cite: 2]
-  const alarmSound = new Audio("alarm_2.wav");[cite: 2]
+  let wakeLock = null;
+  let isTimerRunning = false;
 
   function initWebAudio() {
-    if (!audioCtx) {
-      audioCtx = new AudioContext();
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  // 2. 雙重防休眠機制 (Wake Lock 優先，失敗則使用微型影片備用)
+  async function enableKeepScreenOn() {
+    // 嘗試方案 A：Wake Lock API
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        console.log("Wake Lock 啟用成功！");
+        return;
+      }
+    } catch (err) {
+      console.log("Wake Lock 受阻，切換至備用影片防休眠方案");
     }
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume();
+
+    // 嘗試方案 B：隱藏影片保鮮播放 (NoSleep Trick)
+    if (videoElem) {
+      videoElem.play().then(() => {
+        console.log("隱藏影片防休眠啟用成功！");
+      }).catch(e => console.log("影片防休眠啟動失敗:", e));
     }
   }
 
-  // 背景微聲震盪器（避免瀏覽器暫停音訊通道）
+  function disableKeepScreenOn() {
+    if (wakeLock !== null) {
+      wakeLock.release().then(() => { wakeLock = null; });
+    }
+    if (videoElem) {
+      videoElem.pause();
+    }
+    console.log("防休眠機制已關閉");
+  }
+
+  // 3. 微聲震盪器（確保背景 Audio Context 不凍結）
   function startAudioKeepAlive() {
     initWebAudio();
     if (oscNode) return;
 
     oscNode = audioCtx.createOscillator();
     gainNode = audioCtx.createGain();
-
-    // 音量設為極微弱的 0.0001
     gainNode.gain.setValueAtTime(0.0001, audioCtx.currentTime);
     oscNode.frequency.setValueAtTime(440, audioCtx.currentTime);
 
@@ -604,47 +616,39 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   }
 
-  // 3. 核心功能：螢幕保持常亮 (Screen Wake Lock API)
-  let wakeLock = null;
-  let isTimerRunning = false;
-
-  async function requestWakeLock() {
-    try {
-      if ('wakeLock' in navigator) {
-        wakeLock = await navigator.wakeLock.request('screen');
-        console.log("螢幕常亮功能已啟動");
-      }
-    } catch (err) {
-      console.log("Wake Lock 啟動失敗或不受支援:", err);
-    }
-  }
-
-  function releaseWakeLock() {
-    if (wakeLock !== null) {
-      wakeLock.release().then(() => { wakeLock = null; });
-      console.log("螢幕常亮已解除");
-    }
-  }
-
-  // 當使用者切回頁面且計時還在進行時，自動補重新申請螢幕常亮
-  document.addEventListener('visibilitychange', async () => {
-    if (isTimerRunning && document.visibilityState === 'visible') {
-      await requestWakeLock();
-    }
-  });
-
-  // 4. 全頁面觸發事件：點擊畫面任意處解鎖所有音訊與常亮權限
+  // 4. 全頁面點擊事件：解鎖音訊與影片播放權限
   document.addEventListener('click', function unlockEverything() {
     initWebAudio();
     alarmSound.load();
-    // 預先預熱播放一次鬧鐘音效並歸零，獲得手機完全播放權限
+    // 預先啟動影片播放權限
+    videoElem.play().then(() => videoElem.pause()).catch(() => {});
+    
     alarmSound.play().then(() => {
       alarmSound.pause();
       alarmSound.currentTime = 0;
     }).catch(() => {});
   }, { once: true });
 
-  // 5. 響鈴控制 (專注 10 次 / 休息 5 次)
+  // 5. Web Worker 獨立背景計時器
+  const workerCode = `
+    let timer = null;
+    self.onmessage = function(e) {
+      if (e.data.cmd === 'start') {
+        const targetTime = e.data.targetTime;
+        if (timer) clearInterval(timer);
+        timer = setInterval(() => {
+          if (Date.now() >= targetTime) {
+            clearInterval(timer);
+            self.postMessage('TIME_UP');
+          }
+        }, 300);
+      }
+    };
+  `;
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  const worker = new Worker(URL.createObjectURL(blob));
+
+  // 6. 響鈴控制 (專注 10 次 / 休息 5 次)
   function ringAlarm(repeatTimes) {
     let currentCount = 0;
 
@@ -654,20 +658,18 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         alarmSound.currentTime = 0;
         alarmSound.play().catch(e => console.log(e));
       } else {
-        // 響鈴結束，重置計時狀態並釋放螢幕常亮與音訊資源
         isTimerRunning = false;
         stopAudioKeepAlive();
-        releaseWakeLock();
+        disableKeepScreenOn(); // 倒數結束，關閉影片與常亮防護
       }
     };
 
     alarmSound.currentTime = 0;
-    alarmSound.play().catch(e => console.log("響鈴播放被攔截:", e));
+    alarmSound.play().catch(e => console.log("響鈴失敗:", e));
   }
 
   let currentStageMode = 1;
 
-  // 收到 Web Worker 時間到訊號
   worker.onmessage = function(e) {
     if (e.data === 'TIME_UP') {
       const repeatTimes = (currentStageMode === 1) ? 10 : 5;
@@ -675,20 +677,20 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   };
 
-  // 6. 核心啟動計時函式
+  // 7. 啟動計時主邏輯
   function startPomodoroBySeconds(seconds, stageMode) {
     isTimerRunning = true;
     currentStageMode = stageMode;
 
     initWebAudio();
-    requestWakeLock();      // 啟動螢幕保持常亮！
-    startAudioKeepAlive(); // 啟動背景音訊保鮮
+    enableKeepScreenOn();  // 啟動雙重防鎖屏 (Wake Lock + 影片)
+    startAudioKeepAlive(); // 啟動背景 Audio 保鮮
 
     const targetTime = Date.now() + seconds * 1000;
     worker.postMessage({ cmd: 'start', targetTime: targetTime });
   }
 
-  // 7. 自動監聽 Scratch 變數 (all, 階段, 啟動觸發)
+  // 8. 監聽 Scratch 變數
   setInterval(() => {
     if (window.P2 && P2.p2 && P2.p2.vm) {
       const vm = P2.p2.vm;
@@ -702,7 +704,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         const stageVar = vars.find(v => v.name === '階段');
 
         if (triggerVar && Number(triggerVar.value) === 1) {
-          triggerVar.value = 0; // 歸零旗標
+          triggerVar.value = 0;
 
           const seconds = allVar ? Number(allVar.value) : 1500;
           const stageVal = stageVar ? Number(stageVar.value) : 1;
