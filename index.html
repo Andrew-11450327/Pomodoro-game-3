@@ -538,10 +538,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     run().catch(handleError);
   </script>
 <!-- ======================================================= -->
-<!-- 15-25分鐘長計時防深度休眠 (Web Worker + Web Audio 震盪器) -->
+<!-- 全功能終極版：螢幕強制常亮 (Wake Lock) + 多執行緒 + 雙重音訊    -->
 <!-- ======================================================= -->
 <script>
-  // 1. 建立 Web Worker (獨立背景執行緒，不受主線程鎖屏凍結影響)
+  // 1. 建立 Web Worker（獨立背景執行緒，確保倒數時間絕對精準）
   const workerCode = `
     let timer = null;
     self.onmessage = function(e) {
@@ -553,7 +553,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
             clearInterval(timer);
             self.postMessage('TIME_UP');
           }
-        }, 500);
+        }, 300);
       } else if (e.data.cmd === 'stop') {
         if (timer) clearInterval(timer);
       }
@@ -562,12 +562,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
   const blob = new Blob([workerCode], { type: 'application/javascript' });
   const worker = new Worker(URL.createObjectURL(blob));
 
-  // 2. 初始化 Web Audio API 底層震盪器 (防止手機 5 分鐘後進入 Deep Sleep)
+  // 2. 音訊元件與 Web Audio API 初始化
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   let audioCtx = null;
   let oscNode = null;
   let gainNode = null;
 
+  // 音效檔案載入 (請確認 alarm_2.wav 與 HTML 放在同資料夾下)[cite: 2]
   const alarmSound = new Audio("alarm_2.wav");[cite: 2]
 
   function initWebAudio() {
@@ -579,15 +580,15 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   }
 
-  // 啟動人類聽不到（音量 0.0001）但硬體持續運作的音訊震盪器
+  // 背景微聲震盪器（避免瀏覽器暫停音訊通道）
   function startAudioKeepAlive() {
     initWebAudio();
-    if (oscNode) return; // 避免重複建立
+    if (oscNode) return;
 
     oscNode = audioCtx.createOscillator();
     gainNode = audioCtx.createGain();
 
-    // 音量設為極微弱的 0.0001，避免無聲被系統關閉，同時完全不影響聽覺
+    // 音量設為極微弱的 0.0001
     gainNode.gain.setValueAtTime(0.0001, audioCtx.currentTime);
     oscNode.frequency.setValueAtTime(440, audioCtx.currentTime);
 
@@ -603,42 +604,47 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   }
 
-  // 3. 防休眠與媒體卡片設定
+  // 3. 核心功能：螢幕保持常亮 (Screen Wake Lock API)
   let wakeLock = null;
+  let isTimerRunning = false;
+
   async function requestWakeLock() {
     try {
       if ('wakeLock' in navigator) {
         wakeLock = await navigator.wakeLock.request('screen');
+        console.log("螢幕常亮功能已啟動");
       }
-    } catch (err) {}
+    } catch (err) {
+      console.log("Wake Lock 啟動失敗或不受支援:", err);
+    }
   }
 
   function releaseWakeLock() {
     if (wakeLock !== null) {
       wakeLock.release().then(() => { wakeLock = null; });
+      console.log("螢幕常亮已解除");
     }
   }
 
-  function registerMediaSession() {
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: '番茄鐘計時進行中',
-        artist: '資訊獨立研究專案',
-        album: '長時間背景保鮮中'
-      });
-      navigator.mediaSession.setActionHandler('play', () => {});
-      navigator.mediaSession.setActionHandler('pause', () => {});
+  // 當使用者切回頁面且計時還在進行時，自動補重新申請螢幕常亮
+  document.addEventListener('visibilitychange', async () => {
+    if (isTimerRunning && document.visibilityState === 'visible') {
+      await requestWakeLock();
     }
-  }
+  });
 
-  // 使用者點擊頁面時解鎖音訊權限
-  document.addEventListener('click', function() {
+  // 4. 全頁面觸發事件：點擊畫面任意處解鎖所有音訊與常亮權限
+  document.addEventListener('click', function unlockEverything() {
     initWebAudio();
     alarmSound.load();
-    registerMediaSession();
+    // 預先預熱播放一次鬧鐘音效並歸零，獲得手機完全播放權限
+    alarmSound.play().then(() => {
+      alarmSound.pause();
+      alarmSound.currentTime = 0;
+    }).catch(() => {});
   }, { once: true });
 
-  // 4. 響鈴機制 (專注 10 次 / 休息 5 次)
+  // 5. 響鈴控制 (專注 10 次 / 休息 5 次)
   function ringAlarm(repeatTimes) {
     let currentCount = 0;
 
@@ -648,18 +654,20 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         alarmSound.currentTime = 0;
         alarmSound.play().catch(e => console.log(e));
       } else {
+        // 響鈴結束，重置計時狀態並釋放螢幕常亮與音訊資源
+        isTimerRunning = false;
         stopAudioKeepAlive();
         releaseWakeLock();
       }
     };
 
     alarmSound.currentTime = 0;
-    alarmSound.play().catch(e => console.log("響鈴失敗:", e));
+    alarmSound.play().catch(e => console.log("響鈴播放被攔截:", e));
   }
 
   let currentStageMode = 1;
 
-  // 接收 Web Worker 傳回的「時間到」訊號
+  // 收到 Web Worker 時間到訊號
   worker.onmessage = function(e) {
     if (e.data === 'TIME_UP') {
       const repeatTimes = (currentStageMode === 1) ? 10 : 5;
@@ -667,19 +675,20 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     }
   };
 
-  // 5. 核心啟動控制
+  // 6. 核心啟動計時函式
   function startPomodoroBySeconds(seconds, stageMode) {
+    isTimerRunning = true;
     currentStageMode = stageMode;
+
     initWebAudio();
-    requestWakeLock();
-    registerMediaSession();
-    startAudioKeepAlive(); // 啟動背景保鮮震盪器
+    requestWakeLock();      // 啟動螢幕保持常亮！
+    startAudioKeepAlive(); // 啟動背景音訊保鮮
 
     const targetTime = Date.now() + seconds * 1000;
     worker.postMessage({ cmd: 'start', targetTime: targetTime });
   }
 
-  // 6. 自動監聽 Scratch 變數 (all, 階段, 啟動觸發)
+  // 7. 自動監聽 Scratch 變數 (all, 階段, 啟動觸發)
   setInterval(() => {
     if (window.P2 && P2.p2 && P2.p2.vm) {
       const vm = P2.p2.vm;
